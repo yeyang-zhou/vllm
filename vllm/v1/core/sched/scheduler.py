@@ -42,6 +42,7 @@ class Scheduler(SchedulerInterface):
         mm_registry: MultiModalRegistry = MULTIMODAL_REGISTRY,
         include_finished_set: bool = False,
         log_stats: bool = False,
+        newline_token_id_set: set[int] = set(),
     ) -> None:
         self.scheduler_config = scheduler_config
         self.cache_config = cache_config
@@ -49,6 +50,7 @@ class Scheduler(SchedulerInterface):
         self.kv_cache_config = kv_cache_config
         self.log_stats = log_stats
         self.structured_output_manager = structured_output_manager
+        self.newline_token_id_set = newline_token_id_set
 
         # include_finished_set controls whether a separate set of finished
         # request ids should be included in the EngineCoreOutputs returned
@@ -617,6 +619,9 @@ class Scheduler(SchedulerInterface):
             # to return empty token ids for the request.
             for num_new, output_token_id in enumerate(new_token_ids, 1):
                 request.append_output_token_ids(output_token_id)
+                # TODO: only compress in case of newline token
+                if output_token_id in self.newline_token_id_set:
+                    print("bingo", output_token_id)
 
                 # Check for stop and update request state.
                 # This must be called before we make the EngineCoreOutput.
