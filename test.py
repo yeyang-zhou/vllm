@@ -5,7 +5,7 @@ prompts = [
     "Good morning",
 ]
 sampling_params = SamplingParams(temperature=0.8, top_p=0.95)
-llm = LLM(model="facebook/opt-125m", enforce_eager=True, enable_prefix_caching=False)
+llm = LLM(model="facebook/opt-125m", gpu_memory_utilization=0.95, enforce_eager=True, enable_prefix_caching=False)
 outputs = llm.generate(prompts, sampling_params)
 
 for output in outputs:
