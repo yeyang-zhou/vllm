@@ -121,7 +121,7 @@ class LLMEngine:
                    log_stats=(not disable_log_stats),
                    usage_context=usage_context,
                    stat_loggers=stat_loggers,
-                   multiprocess_mode=False) # TODO: update envs.VLLM_ENABLE_V1_MULTIPROCESSING instead
+                   multiprocess_mode=False)  # TODO: updating constant somehow doesn't work
 
     @classmethod
     def from_engine_args(

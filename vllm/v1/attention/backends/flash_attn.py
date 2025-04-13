@@ -312,7 +312,7 @@ class FlashAttentionImpl(AttentionImpl):
                 if not attn_metadata.should_compress_list[i]:
                     continue
                 # TODO: compress kv cache and persist to GPU
-                num_dropped_tokens_i = i ## TODO: update value
+                num_dropped_tokens_i = i  # TODO: update value
                 if num_dropped_tokens_i != attn_metadata.num_dropped_tokens_list[i]:
                     assert attn_metadata.num_dropped_tokens_list[i] == 0
                     attn_metadata.num_dropped_tokens_list[i] = num_dropped_tokens_i

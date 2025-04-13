@@ -414,6 +414,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             # Update the persistent batch.
             self.input_batch.num_computed_tokens_cpu[req_index] = (
                 num_computed_tokens)
+            self.input_batch.num_dropped_tokens_list_cpu[req_index] = (
+                req_data.num_dropped_tokens)
+            self.input_batch.should_compress_list[req_index] = \
+                req_data.should_compress
             self.input_batch.block_table.append_row(req_data.new_block_ids,
                                                     req_index)
             # Add new_token_ids to token_ids_cpu.
@@ -581,11 +585,13 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 scheduler_output.num_common_prefix_blocks,
             )
 
+        should_compress_list = tuple(self.input_batch.should_compress_list[:num_reqs])
         attn_metadata = self.attn_metadata_builder.build(
             num_reqs=num_reqs,
             num_actual_tokens=total_num_scheduled_tokens,
             max_query_len=max_num_scheduled_tokens,
             common_prefix_len=common_prefix_len,
+            should_compress_list=should_compress_list,
         )
 
         use_spec_decode = len(
@@ -1219,6 +1225,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             spec_token_ids=spec_token_ids,
             logprobs=logprobs_lists,
             prompt_logprobs_dict=prompt_logprobs_dict,
+            num_dropped_tokens_list=attn_metadata.num_dropped_tokens_list,
         )
 
     def generate_draft_token_ids(

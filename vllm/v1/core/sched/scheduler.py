@@ -471,6 +471,8 @@ class Scheduler(SchedulerInterface):
             req_data.new_token_ids = new_token_ids
             req_data.new_block_ids = new_block_ids
             req_data.num_computed_tokens = num_computed_tokens
+            req_data.num_dropped_tokens = request.num_dropped_tokens
+            req_data.should_compress = request.should_compress
         else:
             req_data = CachedRequestData.from_request(request,
                                                       resumed_from_preemption,
