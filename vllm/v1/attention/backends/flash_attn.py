@@ -86,8 +86,8 @@ class FlashAttentionMetadata:
     block_table: torch.Tensor
     slot_mapping: torch.Tensor
     num_reqs: int
-    should_compress: tuple[bool, ...]
-    num_dropped_tokens: list[int]
+    should_compress_list: tuple[bool, ...]
+    num_dropped_tokens_list: list[int]
 
     # For cascade attention.
     use_cascade: bool
@@ -110,7 +110,7 @@ class FlashAttentionMetadataBuilder:
         return False
 
     def build(self, num_reqs: int, num_actual_tokens: int, max_query_len: int,
-              common_prefix_len: int, should_compress: tuple[bool, ...]):
+              common_prefix_len: int, should_compress_list: tuple[bool, ...]):
         max_seq_len = self.runner.seq_lens_np[:num_reqs].max()
         query_start_loc = self.runner.query_start_loc_cpu[:num_reqs + 1].to(
             self.runner.device, non_blocking=True)
@@ -139,7 +139,7 @@ class FlashAttentionMetadataBuilder:
             prefix_kv_lens = None
             suffix_kv_lens = None
 
-        num_dropped_tokens = [0] * num_reqs
+        num_dropped_tokens_list = [0] * num_reqs
 
         attn_metadata = FlashAttentionMetadata(
             num_actual_tokens=num_actual_tokens,
@@ -155,8 +155,8 @@ class FlashAttentionMetadataBuilder:
             prefix_kv_lens=prefix_kv_lens,
             suffix_kv_lens=suffix_kv_lens,
             num_reqs=num_reqs,
-            should_compress=should_compress,
-            num_dropped_tokens=num_dropped_tokens,
+            should_compress_list=should_compress_list,
+            num_dropped_tokens_list=num_dropped_tokens_list,
         )
         return attn_metadata
 
@@ -309,13 +309,13 @@ class FlashAttentionImpl(AttentionImpl):
                 v_descale=layer._v_scale.expand(descale_shape),
             )
             for i in range(attn_metadata.num_reqs):
-                if not attn_metadata.should_compress[i]:
+                if not attn_metadata.should_compress_list[i]:
                     continue
                 # TODO: compress kv cache and persist to GPU
                 num_dropped_tokens_i = i ## TODO: update value
-                if num_dropped_tokens_i != attn_metadata.num_dropped_tokens[i]:
-                    assert attn_metadata.num_dropped_tokens[i] == 0
-                    attn_metadata.num_dropped_tokens[i] = num_dropped_tokens_i
+                if num_dropped_tokens_i != attn_metadata.num_dropped_tokens_list[i]:
+                    assert attn_metadata.num_dropped_tokens_list[i] == 0
+                    attn_metadata.num_dropped_tokens_list[i] = num_dropped_tokens_i
             return output
 
         # Cascade attention (rare case).
