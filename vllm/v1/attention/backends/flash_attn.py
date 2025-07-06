@@ -6,11 +6,14 @@ from typing import TYPE_CHECKING, Any, Optional
 import numpy as np
 import torch
 
+from rkv.modeling import R1KV
+
 from vllm import _custom_ops as ops
 from vllm.attention.backends.abstract import (AttentionBackend, AttentionImpl,
                                               AttentionMetadata, AttentionType,
                                               is_quantized_kv_cache)
 from vllm.attention.ops.merge_attn_states import merge_attn_states
+from vllm.envs import VLLM_V1_R_KV_COMPRESSION_INTERVAL
 from vllm.logger import init_logger
 from vllm.platforms import current_platform
 from vllm.utils import cdiv
@@ -423,6 +426,8 @@ class FlashAttentionImpl(AttentionImpl):
             and not flash_attn_supports_fp8():
             raise NotImplementedError(
                 "FlashAttention does not support fp8 kv-cache on this device.")
+        # Enable KV compression if interval is set (only supported in VLLM v1)
+        self.kvcompressor = R1KV(budget=2048) if VLLM_V1_R_KV_COMPRESSION_INTERVAL > 0 else None
 
     def forward(
         self,
