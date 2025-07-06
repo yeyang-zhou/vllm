@@ -28,8 +28,9 @@ if TYPE_CHECKING:
 if current_platform.is_cuda():
     from vllm.vllm_flash_attn import flash_attn_varlen_func
 
-logger = init_logger(__name__)
+from vllm.r1_kv.modeling import R1KV
 
+logger = init_logger(__name__)
 
 class FlashAttentionBackend(AttentionBackend):
 
@@ -538,13 +539,43 @@ class FlashAttentionImpl(AttentionImpl):
                 k_descale=layer._k_scale.expand(descale_shape),
                 v_descale=layer._v_scale.expand(descale_shape),
             )
+            seq_starts_ends_indices = torch.concat(
+                (torch.tensor([0], dtype=torch.int32, device=attn_metadata.seq_lens.device),
+                 torch.cumsum(attn_metadata.seq_lens, dim=0) - 1),
+                dim=0
+            )
             for i in range(attn_metadata.num_reqs):
                 if not attn_metadata.should_compress_list[i]:
                     continue
-                print(attn_metadata.occupied_slot_mapping)
-                print(attn_metadata.seq_lens)
-                # TODO: compress kv cache and persist to GPU
-                num_dropped_tokens_i = i  # TODO: update value
+                current_key_cache = key_cache.view(-1, key_cache.size(-2), key_cache.size(-1))[
+                    attn_metadata.occupied_slot_mapping[seq_starts_ends_indices[i]:seq_starts_ends_indices[i + 1]], ...
+                ]
+                current_value_cache = value_cache.view(-1, value_cache.size(-2), value_cache.size(-1))[
+                    attn_metadata.occupied_slot_mapping[seq_starts_ends_indices[i]:seq_starts_ends_indices[i + 1]], ...
+                ]
+
+                # [nhead, kv_len, head_dim]
+                current_key_cache = current_key_cache.transpose(0, 1)
+                current_value_cache = current_value_cache.transpose(0, 1)
+
+                current_kv_len = current_key_cache.size(0)
+
+                compressed_key_cache, compressed_value_cache = self.kvcompressor.update_kv(
+                    current_key_cache,
+                    query,
+                    current_value_cache,
+                )
+
+                # overwrite key_cache and value_cache
+                compressed_kv_len = compressed_key_cache.size(0)
+                key_cache.view(-1, key_cache.size(-2), key_cache.size(-1))[
+                    attn_metadata.occupied_slot_mapping[seq_starts_ends_indices[i]:seq_starts_ends_indices[i + 1]][:compressed_kv_len], ...
+                ] = compressed_key_cache.transpose(0, 1)
+                value_cache.view(-1, value_cache.size(-2), value_cache.size(-1))[
+                    attn_metadata.occupied_slot_mapping[seq_starts_ends_indices[i]:seq_starts_ends_indices[i + 1]][:compressed_kv_len], ...
+                ] = compressed_value_cache.transpose(0, 1)
+
+                num_dropped_tokens_i = current_kv_len - compressed_kv_len
                 if num_dropped_tokens_i != attn_metadata.num_dropped_tokens_list[i]:
                     assert attn_metadata.num_dropped_tokens_list[i] == 0
                     attn_metadata.num_dropped_tokens_list[i] = num_dropped_tokens_i
