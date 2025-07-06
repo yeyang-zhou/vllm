@@ -9,6 +9,7 @@ from typing import Optional, Union
 
 from vllm.config import (CacheConfig, LoRAConfig, ModelConfig, SchedulerConfig,
                          SpeculativeConfig)
+from vllm.envs import VLLM_V1_R_KV_COMPRESSION_INTERVAL
 from vllm.logger import init_logger
 from vllm.multimodal import MULTIMODAL_REGISTRY, MultiModalRegistry
 from vllm.v1.core.encoder_cache_manager import (EncoderCacheManager,
@@ -363,6 +364,13 @@ class Scheduler(SchedulerInterface):
                 request.status = RequestStatus.RUNNING
                 request.num_computed_tokens = num_computed_tokens
 
+                # Trigger compression every time 128 new tokens are generated
+                compress_every = VLLM_V1_R_KV_COMPRESSION_INTERVAL
+                request.should_compress = (
+                    request.num_tokens // compress_every
+                    > request.num_computed_tokens // compress_every
+                ) if compress_every > 0 else False
+
                 # Encoder-related.
                 if encoder_inputs_to_schedule:
                     scheduled_encoder_inputs[request.request_id] = (
@@ -478,6 +486,8 @@ class Scheduler(SchedulerInterface):
             req_data.new_token_ids = new_token_ids
             req_data.new_block_ids = new_block_ids
             req_data.num_computed_tokens = num_computed_tokens
+            req_data.num_dropped_tokens = request.num_dropped_tokens
+            req_data.should_compress = request.should_compress
         else:
             req_data = CachedRequestData.from_request(request,
                                                       resumed_from_preemption,
@@ -573,6 +583,7 @@ class Scheduler(SchedulerInterface):
         spec_token_ids = model_runner_output.spec_token_ids
         logprobs = model_runner_output.logprobs
         prompt_logprobs_dict = model_runner_output.prompt_logprobs_dict
+        num_dropped_tokens_list = model_runner_output.num_dropped_tokens_list
         num_scheduled_tokens = scheduler_output.num_scheduled_tokens
 
         new_running: list[Request] = []
@@ -592,6 +603,7 @@ class Scheduler(SchedulerInterface):
 
             req_index = model_runner_output.req_id_to_index[req_id]
             generated_token_ids = sampled_token_ids[req_index]
+            request.num_dropped_tokens += num_dropped_tokens_list[req_index]
 
             scheduled_spec_token_ids = (
                 scheduler_output.scheduled_spec_decode_tokens.get(req_id))

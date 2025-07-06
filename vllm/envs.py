@@ -107,6 +107,7 @@ if TYPE_CHECKING:
     VLLM_TPU_BUCKET_PADDING_GAP: int = 0
     VLLM_USE_DEEP_GEMM: bool = False
     VLLM_XGRAMMAR_CACHE_MB: int = 0
+    VLLM_V1_R_KV_COMPRESSION_INTERVAL: int = 128
 
 
 def get_default_cache_root():
@@ -704,6 +705,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # It can be changed with this variable if needed for some reason.
     "VLLM_XGRAMMAR_CACHE_MB":
     lambda: int(os.getenv("VLLM_XGRAMMAR_CACHE_MB", "512")),
+
+    # Controls the number of tokens generated before compression is triggered.
+    # By default, compression occurs every 128 tokens to optimize performance and resource usage.
+    # Increase this value to compress less frequently or decrease it to compress more often.
+    # Note: This setting applies only to vllm v1 and is not supported in v0.
+    "VLLM_V1_R_KV_COMPRESSION_INTERVAL":
+    lambda: int(os.getenv("VLLM_V1_R_KV_COMPRESSION_INTERVAL", "128")),
 }
 
 # end-env-vars-definition
