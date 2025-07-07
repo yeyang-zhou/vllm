@@ -9,7 +9,7 @@ from typing import Optional, Union
 
 from vllm.config import (CacheConfig, LoRAConfig, ModelConfig, SchedulerConfig,
                          SpeculativeConfig)
-from vllm.envs import VLLM_V1_R_KV_COMPRESSION_INTERVAL
+from vllm.envs import VLLM_V1_R_KV_BUFFER
 from vllm.logger import init_logger
 from vllm.multimodal import MULTIMODAL_REGISTRY, MultiModalRegistry
 from vllm.v1.core.encoder_cache_manager import (EncoderCacheManager,
@@ -365,7 +365,7 @@ class Scheduler(SchedulerInterface):
                 request.num_computed_tokens = num_computed_tokens
 
                 # Trigger compression every time 128 new tokens are generated
-                compress_every = VLLM_V1_R_KV_COMPRESSION_INTERVAL
+                compress_every = VLLM_V1_R_KV_BUFFER
                 request.should_compress = (
                     request.num_tokens // compress_every
                     > request.num_computed_tokens // compress_every

@@ -13,7 +13,7 @@ from vllm.attention.backends.abstract import (AttentionBackend, AttentionImpl,
                                               AttentionMetadata, AttentionType,
                                               is_quantized_kv_cache)
 from vllm.attention.ops.merge_attn_states import merge_attn_states
-from vllm.envs import VLLM_V1_R_KV_COMPRESSION_INTERVAL
+from vllm.envs import VLLM_V1_R_KV_BUDGET, VLLM_V1_R_KV_BUFFER
 from vllm.logger import init_logger
 from vllm.platforms import current_platform
 from vllm.utils import cdiv
@@ -428,7 +428,7 @@ class FlashAttentionImpl(AttentionImpl):
             raise NotImplementedError(
                 "FlashAttention does not support fp8 kv-cache on this device.")
         # Enable KV compression if interval is set (only supported in VLLM v1)
-        self.kvcompressor = R1KV(budget=2048) if VLLM_V1_R_KV_COMPRESSION_INTERVAL > 0 else None
+        self.kvcompressor = R1KV(budget=VLLM_V1_R_KV_BUDGET)
 
     def forward(
         self,
@@ -545,7 +545,7 @@ class FlashAttentionImpl(AttentionImpl):
                 dim=0
             )
             for i in range(attn_metadata.num_reqs):
-                if not attn_metadata.should_compress_list[i]:
+                if attn_metadata.seq_lens[i].cpu().item() < VLLM_V1_R_KV_BUDGET + VLLM_V1_R_KV_BUFFER:
                     continue
                 current_key_cache = key_cache.view(-1, key_cache.size(-2), key_cache.size(-1))[
                     attn_metadata.occupied_slot_mapping[seq_starts_ends_indices[i]:seq_starts_ends_indices[i + 1]], ...
@@ -554,25 +554,32 @@ class FlashAttentionImpl(AttentionImpl):
                     attn_metadata.occupied_slot_mapping[seq_starts_ends_indices[i]:seq_starts_ends_indices[i + 1]], ...
                 ]
 
-                # [nhead, kv_len, head_dim]
+                # [num_heads, num_tokens, head_dim]
+                current_query = query.transpose(0, 1)
                 current_key_cache = current_key_cache.transpose(0, 1)
                 current_value_cache = current_value_cache.transpose(0, 1)
 
-                current_kv_len = current_key_cache.size(0)
+                # [batch_size, num_heads, num_tokens, head_dim]
+                current_query = current_query.unsqueeze(0)
+                current_key_cache = current_key_cache.unsqueeze(0)
+                current_value_cache = current_value_cache.unsqueeze(0)
 
+                current_kv_len = current_key_cache.size(2)
                 compressed_key_cache, compressed_value_cache = self.kvcompressor.update_kv(
                     current_key_cache,
-                    query,
+                    current_query,
                     current_value_cache,
                 )
+                compressed_key_cache = compressed_key_cache.squeeze(0)
+                compressed_value_cache = compressed_value_cache.squeeze(0)
 
                 # overwrite key_cache and value_cache
-                compressed_kv_len = compressed_key_cache.size(0)
+                compressed_kv_len = compressed_key_cache.size(1)
                 key_cache.view(-1, key_cache.size(-2), key_cache.size(-1))[
-                    attn_metadata.occupied_slot_mapping[seq_starts_ends_indices[i]:seq_starts_ends_indices[i + 1]][:compressed_kv_len], ...
+                    attn_metadata.occupied_slot_mapping[seq_starts_ends_indices[i]:seq_starts_ends_indices[i]+compressed_kv_len], ...
                 ] = compressed_key_cache.transpose(0, 1)
                 value_cache.view(-1, value_cache.size(-2), value_cache.size(-1))[
-                    attn_metadata.occupied_slot_mapping[seq_starts_ends_indices[i]:seq_starts_ends_indices[i + 1]][:compressed_kv_len], ...
+                    attn_metadata.occupied_slot_mapping[seq_starts_ends_indices[i]:seq_starts_ends_indices[i]+compressed_kv_len], ...
                 ] = compressed_value_cache.transpose(0, 1)
 
                 num_dropped_tokens_i = current_kv_len - compressed_kv_len
