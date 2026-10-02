@@ -529,15 +529,21 @@ class KVConnectorBase_V1(ABC):
         """
         return
 
-    def update_connector_output(self, connector_output: KVConnectorOutput):
+    def update_connector_output(
+        self, connector_output: KVConnectorOutput
+    ) -> dict[str, int] | None:
         """
         Update KVConnector state from worker-side connectors output.
 
         Args:
             connector_output (KVConnectorOutput): the worker-side
                 connectors output.
+
+        Returns:
+            Optional mapping from request ID to authoritative resident KV
+            token count after worker-side compaction.
         """
-        return
+        return None
 
     def request_finished(
         self,

@@ -2483,7 +2483,14 @@ class Scheduler(SchedulerInterface):
         """
 
         if self.connector is not None:
-            self.connector.update_connector_output(kv_connector_output)
+            resident_kv_tokens = self.connector.update_connector_output(
+                kv_connector_output
+            )
+            if resident_kv_tokens:
+                for req_id, num_tokens in resident_kv_tokens.items():
+                    self.kv_cache_manager.commit_resident_kv(
+                        self.requests[req_id], num_tokens
+                    )
 
         # KV Connector:: update recv and send status from last step.
         for req_id in kv_connector_output.finished_recving or ():
