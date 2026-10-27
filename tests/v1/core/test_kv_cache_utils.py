@@ -37,6 +37,7 @@ from vllm.multimodal.inputs import (
 )
 from vllm.sampling_params import SamplingParams
 from vllm.utils.hashing import sha256, sha256_cbor, xxhash, xxhash_cbor
+from vllm.utils.math_utils import cdiv
 from vllm.v1.core.kv_cache_manager import KVCacheBlocks, KVCacheManager
 from vllm.v1.core.kv_cache_planning import (
     get_kv_cache_groups,
@@ -2282,3 +2283,90 @@ def test_null_head_len():
         assert null_head_len(table) == expected
     blocks = KVCacheBlocks(([null] * 4 + real, [null] + real[:1] + [null]))
     assert blocks.get_unhashed_block_ids_all_groups() == [[1, 2, 3], [1]]
+
+
+def _make_full_attention_kv_cache_manager(enable_caching=False):
+    kv_cache_config = KVCacheConfig(
+        num_blocks=128,
+        kv_cache_tensors=[],
+        kv_cache_groups=[
+            KVCacheGroupSpec(["layer1"], new_kv_cache_spec(block_size=16))
+        ],
+    )
+    return KVCacheManager(
+        kv_cache_config=kv_cache_config,
+        max_model_len=2048,
+        scheduler_block_size=16,
+        hash_block_size=16,
+        enable_caching=enable_caching,
+    )
+
+
+def _reclaim_compacted_kv_tail_blocks(
+    kv_cache_manager, request, num_resident_kv_tokens
+):
+    """Simulate tail-block reclaim after external GPU compaction completes."""
+    allocated_blocks = kv_cache_manager.coordinator.get_blocks(request.request_id)[0]
+    num_kept_blocks = cdiv(num_resident_kv_tokens, 16)
+    tail_blocks = allocated_blocks[num_kept_blocks:]
+    del allocated_blocks[num_kept_blocks:]
+    kv_cache_manager.block_pool.free_blocks(reversed(tail_blocks))
+    kv_cache_manager.set_resident_kv_tokens(request.request_id, num_resident_kv_tokens)
+
+
+def test_resident_kv_allocation_preserves_logical_length():
+    kv_cache_manager = _make_full_attention_kv_cache_manager()
+    request = make_request("resident", [1] * 104, block_size=16)
+    kv_cache_manager.allocate_slots(request, num_new_tokens=104)
+    request.num_computed_tokens = 104
+    _reclaim_compacted_kv_tail_blocks(kv_cache_manager, request, 32)
+    assert kv_cache_manager.get_resident_kv_tokens(request.request_id) == 32
+
+    new_blocks = kv_cache_manager.allocate_slots(request, num_new_tokens=1)
+    assert new_blocks is not None
+    assert len(new_blocks.get_block_ids()[0]) == 1
+    assert len(kv_cache_manager.coordinator.get_blocks(request.request_id)[0]) == 3
+    assert request.num_computed_tokens == 104
+    assert kv_cache_manager.get_resident_kv_tokens(request.request_id) == 33
+
+    request.num_computed_tokens += 1
+    new_blocks = kv_cache_manager.allocate_slots(request, num_new_tokens=1)
+    assert new_blocks is not None
+    assert len(new_blocks.get_block_ids()[0]) == 0
+    assert kv_cache_manager.get_resident_kv_tokens(request.request_id) == 34
+
+
+def test_resident_kv_does_not_disable_normal_prefix_caching():
+    kv_cache_manager = _make_full_attention_kv_cache_manager(enable_caching=True)
+    compacted_request = make_request("resident", [1] * 104, block_size=16)
+    kv_cache_manager.allocate_slots(
+        compacted_request, num_new_tokens=104, delay_cache_blocks=True
+    )
+    compacted_request.num_computed_tokens = 104
+    _reclaim_compacted_kv_tail_blocks(kv_cache_manager, compacted_request, 32)
+    kv_cache_manager.allocate_slots(compacted_request, num_new_tokens=1)
+    compacted_blocks = kv_cache_manager.coordinator.get_blocks(
+        compacted_request.request_id
+    )[0]
+    assert all(block.block_hash is None for block in compacted_blocks)
+
+    normal_request = make_request("normal", [2] * 33, block_size=16, hash_fn=sha256)
+    assert kv_cache_manager.get_resident_kv_tokens(normal_request.request_id) is None
+    kv_cache_manager.allocate_slots(normal_request, num_new_tokens=33)
+    normal_blocks = kv_cache_manager.coordinator.get_blocks(normal_request.request_id)[
+        0
+    ]
+    assert any(block.block_hash is not None for block in normal_blocks)
+
+
+def test_resident_kv_state_clears_on_free():
+    kv_cache_manager = _make_full_attention_kv_cache_manager()
+    request = make_request("resident", [1] * 104, block_size=16)
+    kv_cache_manager.allocate_slots(request, num_new_tokens=104)
+    request.num_computed_tokens = 104
+    _reclaim_compacted_kv_tail_blocks(kv_cache_manager, request, 32)
+    kv_cache_manager.free(request)
+    assert kv_cache_manager.get_resident_kv_tokens(request.request_id) is None
+    request.num_computed_tokens = 0
+    assert kv_cache_manager.allocate_slots(request, num_new_tokens=104) is not None
+    assert len(kv_cache_manager.coordinator.get_blocks(request.request_id)[0]) == 7

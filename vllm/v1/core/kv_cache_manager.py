@@ -203,6 +203,7 @@ class KVCacheManager:
             if manager.retains_longer_hit
         )
         self.kv_cache_config = kv_cache_config
+        self._resident_kv_tokens: dict[str, int] = {}
 
         # Watermark: minimum number of KV cache blocks to keep free when
         # admitting waiting/preempted requests, to avoid frequent preemptions.
@@ -514,6 +515,18 @@ class KVCacheManager:
             num_local_computed_tokens + num_external_computed_tokens,
             self.max_model_len,
         )
+        num_resident_kv_tokens = self._resident_kv_tokens.get(request.request_id)
+        if num_resident_kv_tokens is not None and (
+            num_new_computed_tokens
+            or num_external_computed_tokens
+            or num_lookahead_tokens
+            or num_encoder_tokens
+            or full_sequence_must_fit
+        ):
+            raise ValueError(
+                "Resident KV allocation does not support cache hits, external KV, "
+                "encoder tokens, lookahead, or full-sequence admission"
+            )
 
         watermark_blocks = 0
         # The watermark is applied to waiting/preempted requests only, and only
@@ -547,7 +560,10 @@ class KVCacheManager:
             if required_blocks > self.block_pool.get_num_free_blocks():
                 return None
 
-        num_tokens_main_model = total_computed_tokens + num_new_tokens
+        if num_resident_kv_tokens is not None:
+            num_tokens_main_model = num_resident_kv_tokens + num_new_tokens
+        else:
+            num_tokens_main_model = total_computed_tokens + num_new_tokens
         num_tokens_need_slot = min(
             num_tokens_main_model + num_lookahead_tokens, self.max_model_len
         )
@@ -607,10 +623,12 @@ class KVCacheManager:
             num_tokens_main_model,
             num_encoder_tokens,
         )
+        if num_resident_kv_tokens is not None:
+            self._resident_kv_tokens[request.request_id] = num_tokens_main_model
 
         # P/D: delay caching blocks if we have to recv from
         # remote. Update state for locally cached blocks.
-        if delay_cache_blocks:
+        if delay_cache_blocks or num_resident_kv_tokens is not None:
             return self.create_kv_cache_blocks(new_blocks)
 
         # NOTE(woosuk): We want to commit (cache) up to num_local_computed_tokens
@@ -626,6 +644,27 @@ class KVCacheManager:
 
         return self.create_kv_cache_blocks(new_blocks)
 
+    def set_resident_kv_tokens(
+        self, request_id: str, num_resident_kv_tokens: int
+    ) -> None:
+        """Set the physical KV length after GPU compaction and tail reclaim.
+
+        Intended external caller: LMCache's scheduler integration
+        (https://github.com/LMCache/LMCache/pull/6035), activated by a
+        follow-up LMCache integration PR.
+        """
+        if num_resident_kv_tokens <= 0:
+            raise ValueError("Resident KV length must be positive")
+        self._resident_kv_tokens[request_id] = num_resident_kv_tokens
+
+    def get_resident_kv_tokens(self, request_id: str) -> int | None:
+        """Return the current resident KV allocation length, if compacted.
+
+        Includes slots reserved by successful allocate_slots() calls.
+        None means the request uses ordinary logical-length allocation.
+        """
+        return self._resident_kv_tokens.get(request_id)
+
     def free(self, request: Request) -> None:
         """Free the blocks allocated for the request.
         We free the blocks in reverse order so that the tail blocks are evicted
@@ -635,6 +674,7 @@ class KVCacheManager:
             request: The request to free the blocks.
 
         """
+        self._resident_kv_tokens.pop(request.request_id, None)
         self.coordinator.free(request.request_id)
 
     def remove_skipped_blocks(
@@ -669,6 +709,7 @@ class KVCacheManager:
             The request's blocks in allocation order.
 
         """
+        self._resident_kv_tokens.pop(request.request_id, None)
         return self.coordinator.pop_blocks_for_free(request.request_id)
 
     def evict_blocks(self, block_ids: set[int]) -> None:
