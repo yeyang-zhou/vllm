@@ -20,6 +20,7 @@ from vllm.v1.kv_cache_interface import (
     AttentionSpec,
     CrossAttentionSpec,
     EncoderOnlyAttentionSpec,
+    FullAttentionSpec,
     KVCacheConfig,
     MambaSpec,
     get_kv_cache_spec_kind,
@@ -203,6 +204,9 @@ class KVCacheManager:
             if manager.retains_longer_hit
         )
         self.kv_cache_config = kv_cache_config
+        # Present only after an external compactor has shortened a request's
+        # resident KV. Uncompacted requests keep the existing allocation path.
+        self._resident_kv_tokens: dict[str, int] = {}
 
         # Watermark: minimum number of KV cache blocks to keep free when
         # admitting waiting/preempted requests, to avoid frequent preemptions.
@@ -515,6 +519,19 @@ class KVCacheManager:
             self.max_model_len,
         )
 
+        resident_kv_tokens = self._resident_kv_tokens.get(request.request_id)
+        if resident_kv_tokens is not None and (
+            num_new_computed_tokens
+            or num_external_computed_tokens
+            or num_lookahead_tokens
+            or num_encoder_tokens
+            or full_sequence_must_fit
+        ):
+            raise ValueError(
+                "Resident KV mode does not support cache hits, external "
+                "computed tokens, or lookahead tokens"
+            )
+
         watermark_blocks = 0
         # The watermark is applied to waiting/preempted requests only, and only
         # when there's at least one request already scheduled.
@@ -547,7 +564,10 @@ class KVCacheManager:
             if required_blocks > self.block_pool.get_num_free_blocks():
                 return None
 
-        num_tokens_main_model = total_computed_tokens + num_new_tokens
+        if resident_kv_tokens is not None:
+            num_tokens_main_model = resident_kv_tokens + num_new_tokens
+        else:
+            num_tokens_main_model = total_computed_tokens + num_new_tokens
         num_tokens_need_slot = min(
             num_tokens_main_model + num_lookahead_tokens, self.max_model_len
         )
@@ -607,10 +627,15 @@ class KVCacheManager:
             num_tokens_main_model,
             num_encoder_tokens,
         )
+        if resident_kv_tokens is not None:
+            self._resident_kv_tokens[request.request_id] = min(
+                num_tokens_main_model, self.max_model_len
+            )
 
         # P/D: delay caching blocks if we have to recv from
         # remote. Update state for locally cached blocks.
-        if delay_cache_blocks:
+        # Compacted blocks no longer correspond to their original token hashes.
+        if delay_cache_blocks or resident_kv_tokens is not None:
             return self.create_kv_cache_blocks(new_blocks)
 
         # NOTE(woosuk): We want to commit (cache) up to num_local_computed_tokens
@@ -626,6 +651,38 @@ class KVCacheManager:
 
         return self.create_kv_cache_blocks(new_blocks)
 
+    def set_resident_kv_tokens(self, request: Request, num_tokens: int) -> None:
+        """Set the physical allocation frontier after external KV compaction.
+
+        Call only after the worker finishes KV writes and the caller reclaims
+        the unused private tail blocks. Logical request progress is unchanged.
+
+        Args:
+            request: The request whose resident KV was compacted.
+            num_tokens: Number of remaining physical KV tokens.
+        """
+        if self.num_kv_cache_groups != 1:
+            raise ValueError("Resident KV requires exactly one cache group")
+        kv_cache_spec = self.kv_cache_config.kv_cache_groups[0].kv_cache_spec
+        if not isinstance(kv_cache_spec, FullAttentionSpec):
+            raise ValueError("Resident KV requires full attention")
+
+        current = self._resident_kv_tokens.get(
+            request.request_id, request.num_computed_tokens
+        )
+        if not 0 <= num_tokens <= current:
+            raise ValueError("Resident KV length can only shrink")
+
+        blocks = self.coordinator.get_blocks(request.request_id)[0]
+        if any(
+            block.ref_cnt != 1 or block.block_hash is not None or block.is_null
+            for block in blocks
+        ):
+            raise ValueError("Resident KV requires private, uncached blocks")
+        if len(blocks) != cdiv(num_tokens, kv_cache_spec.block_size):
+            raise ValueError("Resident KV length must match allocated blocks")
+        self._resident_kv_tokens[request.request_id] = num_tokens
+
     def free(self, request: Request) -> None:
         """Free the blocks allocated for the request.
         We free the blocks in reverse order so that the tail blocks are evicted
@@ -635,6 +692,7 @@ class KVCacheManager:
             request: The request to free the blocks.
 
         """
+        self._resident_kv_tokens.pop(request.request_id, None)
         self.coordinator.free(request.request_id)
 
     def remove_skipped_blocks(
@@ -669,6 +727,7 @@ class KVCacheManager:
             The request's blocks in allocation order.
 
         """
+        self._resident_kv_tokens.pop(request.request_id, None)
         return self.coordinator.pop_blocks_for_free(request.request_id)
 
     def evict_blocks(self, block_ids: set[int]) -> None:

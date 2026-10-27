@@ -234,3 +234,17 @@ In this example, we assume the block size is 4 (each block can cache 4 tokens), 
 **Time 6: Request 2 comes in with the 29 prompt tokens, where the first 12 tokens are the same as request 0\.** Note that even the block order in the free queue was `7 - 8 - 9 - 4 - 3 - 2 - 6 - 5 - 1 - 0`, the cache hit blocks (i.e., 0, 1, 2) are touched and removed from the queue before allocation, so the free queue becomes `7 - 8 - 9 - 4 - 3 - 6 - 5`. As a result, the allocated blocks are 0 (cached), 1 (cached), 2 (cached), 7, 8, 9, 4, 3 (evicted).
 
 ![Example Time 6](../assets/design/prefix_caching/example-time-7.png)
+
+## Externally compacted KV caches
+
+An external KV compactor may retain fewer KV tokens than the request has
+logically computed. After the worker completes compaction and the caller
+reclaims unused tail blocks, `KVCacheManager.set_resident_kv_tokens()` lets subsequent allocation use the remaining physical KV length
+without changing `request.num_computed_tokens` (the logical model position).
+
+This interface supports one full-attention KV group and private, uncached
+blocks. The caller must prevent prefix-cache lookup and publication for the
+compacted request from its initial allocation; shared or already-cached
+blocks cannot be compacted in place without copy-on-write. Requests without
+a resident-length override retain their normal allocation and prefix caching
+behavior.

@@ -37,6 +37,7 @@ from vllm.multimodal.inputs import (
 )
 from vllm.sampling_params import SamplingParams
 from vllm.utils.hashing import sha256, sha256_cbor, xxhash, xxhash_cbor
+from vllm.utils.math_utils import cdiv
 from vllm.v1.core.kv_cache_manager import KVCacheBlocks, KVCacheManager
 from vllm.v1.core.kv_cache_planning import (
     get_kv_cache_groups,
@@ -2282,3 +2283,179 @@ def test_null_head_len():
         assert null_head_len(table) == expected
     blocks = KVCacheBlocks(([null] * 4 + real, [null] + real[:1] + [null]))
     assert blocks.get_unhashed_block_ids_all_groups() == [[1, 2, 3], [1]]
+
+
+def _make_full_attention_kv_manager(
+    block_size: int = 16,
+    num_blocks: int = 256,
+    enable_caching: bool = False,
+) -> KVCacheManager:
+    config = KVCacheConfig(
+        num_blocks=num_blocks,
+        kv_cache_tensors=[],
+        kv_cache_groups=[
+            KVCacheGroupSpec(["layer1"], new_kv_cache_spec(block_size=block_size)),
+        ],
+    )
+    return KVCacheManager(
+        kv_cache_config=config,
+        max_model_len=4096,
+        scheduler_block_size=block_size,
+        hash_block_size=block_size,
+        enable_caching=enable_caching,
+    )
+
+
+def _commit_external_resident_kv(manager, request, num_tokens: int) -> None:
+    # Simulate an external compactor reclaiming tail blocks before notifying
+    # the allocator. vLLM itself does not perform KV compaction.
+    blocks = manager.coordinator.get_blocks(request.request_id)[0]
+    block_size = manager.kv_cache_config.kv_cache_groups[0].kv_cache_spec.block_size
+    kept_blocks = cdiv(num_tokens, block_size)
+    freed = blocks[kept_blocks:]
+    del blocks[kept_blocks:]
+    if freed:
+        manager.block_pool.free_blocks(reversed(freed))
+    manager.set_resident_kv_tokens(request, num_tokens)
+
+
+@pytest.mark.parametrize(
+    ("logical_phase", "physical_phase"),
+    [(0, 0), (1, 15), (15, 1), (15, 15)],
+)
+def test_resident_kv_reallocation_matches_physical_length(
+    logical_phase: int, physical_phase: int
+):
+    block_size = 16
+    logical_len = block_size * 20 + logical_phase
+    physical_len = block_size * 4 + physical_phase
+    manager = _make_full_attention_kv_manager(block_size)
+    request = make_request(
+        request_id="resident",
+        prompt_token_ids=[1] * logical_len,
+        block_size=block_size,
+    )
+
+    manager.allocate_slots(request, num_new_tokens=logical_len)
+    request.num_computed_tokens = logical_len
+    _commit_external_resident_kv(manager, request, physical_len)
+
+    previous_required = cdiv(physical_len, block_size)
+    for step in range(1, block_size * 2 + 1):
+        new_blocks = manager.allocate_slots(request, num_new_tokens=1)
+        assert new_blocks is not None
+        required = cdiv(physical_len + step, block_size)
+        assert len(new_blocks.get_block_ids()[0]) == required - previous_required
+        assert len(manager.coordinator.get_blocks(request.request_id)[0]) == required
+
+        request.num_computed_tokens += 1
+        previous_required = required
+
+
+def test_resident_kv_state_is_cleared_with_block_ownership():
+    block_size = 16
+    manager = _make_full_attention_kv_manager(block_size)
+    request = make_request(
+        request_id="0",
+        prompt_token_ids=[1] * 104,
+        block_size=block_size,
+    )
+
+    manager.allocate_slots(request, num_new_tokens=104)
+    request.num_computed_tokens = 104
+    _commit_external_resident_kv(manager, request, 32)
+
+    manager.free(request)
+    request.num_computed_tokens = 0
+
+    blocks = manager.allocate_slots(request, num_new_tokens=104)
+    assert blocks is not None
+    assert len(manager.coordinator.get_blocks(request.request_id)[0]) == 7
+
+
+def test_resident_kv_rejects_growth():
+    block_size = 16
+    manager = _make_full_attention_kv_manager(block_size)
+    request = make_request(
+        request_id="0",
+        prompt_token_ids=[1] * 65,
+        block_size=block_size,
+    )
+
+    manager.allocate_slots(request, num_new_tokens=65)
+    request.num_computed_tokens = 65
+
+    # The final allocated block has spare capacity, but resident length is 65.
+    with pytest.raises(ValueError, match="can only shrink"):
+        _commit_external_resident_kv(manager, request, 66)
+
+    _commit_external_resident_kv(manager, request, 32)
+    with pytest.raises(ValueError, match="can only shrink"):
+        _commit_external_resident_kv(manager, request, 33)
+
+
+def test_resident_kv_reallocation_with_prefix_caching_enabled():
+    manager = _make_full_attention_kv_manager(enable_caching=True)
+    request = make_request(
+        request_id="resident",
+        prompt_token_ids=[1] * 104,
+        block_size=16,
+    )
+    # The caller keeps this request's initial KV private (e.g. no APC publish).
+    manager.allocate_slots(request, num_new_tokens=104, delay_cache_blocks=True)
+    request.num_computed_tokens = 104
+    _commit_external_resident_kv(manager, request, 32)
+
+    assert len(manager.coordinator.get_blocks(request.request_id)[0]) == 2
+    new_blocks = manager.allocate_slots(request, num_new_tokens=1)
+    assert new_blocks is not None
+    assert len(new_blocks.get_block_ids()[0]) == 1
+    assert all(
+        block.block_hash is None
+        for block in manager.coordinator.get_blocks(request.request_id)[0]
+    )
+
+    # Normal requests retain native prefix caching.
+    normal = make_request(
+        request_id="normal",
+        prompt_token_ids=[2] * 33,
+        block_size=16,
+        hash_fn=sha256,
+    )
+    manager.allocate_slots(normal, num_new_tokens=33)
+    assert any(
+        block.block_hash is not None
+        for block in manager.coordinator.get_blocks(normal.request_id)[0]
+    )
+
+
+def test_resident_kv_rejects_published_blocks():
+    manager = _make_full_attention_kv_manager(enable_caching=True)
+    request = make_request(
+        request_id="published",
+        prompt_token_ids=[3] * 65,
+        block_size=16,
+        hash_fn=sha256,
+    )
+    manager.allocate_slots(request, num_new_tokens=65)
+    request.num_computed_tokens = 65
+    blocks = manager.coordinator.get_blocks(request.request_id)[0]
+    assert any(block.block_hash is not None for block in blocks)
+
+    with pytest.raises(ValueError, match="private, uncached"):
+        manager.set_resident_kv_tokens(request, 65)
+    assert len(manager.coordinator.get_blocks(request.request_id)[0]) == 5
+
+
+def test_resident_kv_rejects_unreclaimed_tail_blocks():
+    manager = _make_full_attention_kv_manager()
+    request = make_request(
+        request_id="not-reclaimed",
+        prompt_token_ids=[1] * 65,
+        block_size=16,
+    )
+    manager.allocate_slots(request, num_new_tokens=65)
+    request.num_computed_tokens = 65
+
+    with pytest.raises(ValueError, match="must match allocated blocks"):
+        manager.set_resident_kv_tokens(request, 32)
