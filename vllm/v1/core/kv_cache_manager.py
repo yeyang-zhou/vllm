@@ -514,6 +514,20 @@ class KVCacheManager:
             num_local_computed_tokens + num_external_computed_tokens,
             self.max_model_len,
         )
+        num_resident_kv_tokens = request.num_resident_kv_tokens
+        if num_resident_kv_tokens is not None and num_resident_kv_tokens <= 0:
+            raise ValueError("Resident KV length must be positive")
+        if num_resident_kv_tokens is not None and (
+            num_new_computed_tokens
+            or num_external_computed_tokens
+            or num_lookahead_tokens
+            or num_encoder_tokens
+            or full_sequence_must_fit
+        ):
+            raise ValueError(
+                "Resident KV allocation does not support cache hits, external KV, "
+                "encoder tokens, lookahead, or full-sequence admission"
+            )
 
         watermark_blocks = 0
         # The watermark is applied to waiting/preempted requests only, and only
@@ -547,7 +561,10 @@ class KVCacheManager:
             if required_blocks > self.block_pool.get_num_free_blocks():
                 return None
 
-        num_tokens_main_model = total_computed_tokens + num_new_tokens
+        if num_resident_kv_tokens is not None:
+            num_tokens_main_model = num_resident_kv_tokens + num_new_tokens
+        else:
+            num_tokens_main_model = total_computed_tokens + num_new_tokens
         num_tokens_need_slot = min(
             num_tokens_main_model + num_lookahead_tokens, self.max_model_len
         )
@@ -607,10 +624,12 @@ class KVCacheManager:
             num_tokens_main_model,
             num_encoder_tokens,
         )
+        if num_resident_kv_tokens is not None:
+            request.num_resident_kv_tokens = num_tokens_main_model
 
         # P/D: delay caching blocks if we have to recv from
         # remote. Update state for locally cached blocks.
-        if delay_cache_blocks:
+        if delay_cache_blocks or num_resident_kv_tokens is not None:
             return self.create_kv_cache_blocks(new_blocks)
 
         # NOTE(woosuk): We want to commit (cache) up to num_local_computed_tokens
@@ -635,6 +654,7 @@ class KVCacheManager:
             request: The request to free the blocks.
 
         """
+        request.num_resident_kv_tokens = None
         self.coordinator.free(request.request_id)
 
     def remove_skipped_blocks(
@@ -669,6 +689,7 @@ class KVCacheManager:
             The request's blocks in allocation order.
 
         """
+        request.num_resident_kv_tokens = None
         return self.coordinator.pop_blocks_for_free(request.request_id)
 
     def evict_blocks(self, block_ids: set[int]) -> None:

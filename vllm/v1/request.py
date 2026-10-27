@@ -182,6 +182,8 @@ class Request:
 
         self.spec_token_ids: list[int] = []
         self.num_computed_tokens = 0
+        # Optional physical KV length for external compaction (not logical progress).
+        self.num_resident_kv_tokens: int | None = None
         self.cache_salt: str | None = cache_salt
 
         # Multi-modal related
